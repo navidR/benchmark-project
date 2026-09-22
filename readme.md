@@ -239,8 +239,9 @@ A separate wallet-process kill check verified run failure and owned cleanup.
 
 The TUI opens by default. Tab cycles node, wallet, topology, and metric views;
 arrows select entries. `l` opens node logs, `p` peers, `b` the artifact browser,
-`c` the command palette, and `i` MCP connection details. Escape opens the exit
-confirmation. Completed runs can be opened read-only with `--run`.
+`c` the command palette, and `i` MCP connection details. Escape or `q`/`Q` opens
+the exit confirmation; `y` confirms, while `n` or Escape cancels. Completed runs
+can be opened read-only with `--run`.
 
 The application automatically starts an authenticated HTTP MCP endpoint on
 `127.0.0.1` with an allocated port. Connection details are logged and published

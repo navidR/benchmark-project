@@ -9,7 +9,7 @@ file(APPEND "${TEST_ROOT}/events.jsonl" [=[
 {"run_id":"tui-fixture","node_id":"firo-1","event":"wallet_transaction_submitted","detail":"{\"sender_wallet_index\":1,\"receiver_wallet_index\":null,\"receiver_node\":null,\"receiver_address\":\"target-visible-address\",\"external_receiver\":true,\"amount_satoshis\":1000}"}
 ]=])
 string(ASCII 27 escape)
-file(WRITE "${TEST_ROOT}/input" "wc${escape}q")
+file(WRITE "${TEST_ROOT}/input" "wc${escape}qy")
 execute_process(
   COMMAND "${CMAKE_COMMAND}" -E env TERM=xterm COLUMNS=160 LINES=64
     "${TEST_COMMAND}" --run "${TEST_ROOT}"

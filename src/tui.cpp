@@ -2362,7 +2362,7 @@ void DrawFrameBody(const std::filesystem::path& run_root,
     }
     DrawHorizontalLine(rows - 2);
     AddText(rows - 1, 0, cols,
-            "MCP [i]. Arrows select. l node log. Esc asks to exit; q exits.",
+            "MCP [i]. Arrows select. l node log. Esc/q asks to exit.",
             COLOR_PAIR(kColorMuted));
     return;
   }
@@ -2490,7 +2490,7 @@ void DrawFrameBody(const std::filesystem::path& run_root,
     }
     DrawHorizontalLine(rows - 2);
     AddText(rows - 1, 0, cols,
-            "MCP [i]. Arrows select. l node log. Esc asks to exit; q exits.",
+            "MCP [i]. Arrows select. l node log. Esc/q asks to exit.",
             COLOR_PAIR(kColorMuted));
     return;
   }
@@ -2690,9 +2690,10 @@ void DrawFrameBody(const std::filesystem::path& run_root,
   if (node_log_pane.IsOpen()) {
     footer +=
         "Node log: arrows/PgUp/PgDn/Home/End scroll. +/- verbosity. "
-        "l closes. q exits.";
+        "l closes. q asks to exit.";
   } else if (peer_list_pane.IsOpen()) {
-    footer += "Peers: arrows/PgUp/PgDn/Home/End scroll. p closes. q exits.";
+    footer +=
+        "Peers: arrows/PgUp/PgDn/Home/End scroll. p closes. q asks to exit.";
   } else if (network_rule_pane.IsOpen()) {
     footer +=
         "Rules: arrows/PgUp/PgDn/Home/End scroll. a closes. Use "
@@ -2706,8 +2707,8 @@ void DrawFrameBody(const std::filesystem::path& run_root,
         "Logs [/] row, PgUp/PgDn page, Home/End. Arrows select. "
         "Tab/n/w/v/o/g/h "
         "view. b files. p peers. a rules. c command. e export. "
-        "m mining. s stop. f/t freeze/thaw. d/r net. R restart. k kill. Esc "
-        "asks; q exits.";
+        "m mining. s stop. f/t freeze/thaw. d/r net. R restart. k kill. Esc/q "
+        "asks to exit.";
   }
   AddText(rows - 1, 0, cols, footer, COLOR_PAIR(kColorMuted));
 }
@@ -2797,7 +2798,7 @@ void DrawEmptySummary(bool mcp_connection_dialog_open,
   AddText(3, 0, cols, "No active run.", A_BOLD);
   AddText(5, 0, cols, "Waiting for a benchmark run.", COLOR_PAIR(kColorMuted));
   DrawHorizontalLine(rows - 2);
-  AddText(rows - 1, 0, cols, "MCP [i]. Esc asks to exit; q exits.",
+  AddText(rows - 1, 0, cols, "MCP [i]. Esc/q asks to exit.",
           COLOR_PAIR(kColorMuted));
   DrawModalEpilogue(rows, cols, false, "", false, "", "",
 #ifdef BBP_FIRO_GUI_LAUNCHER
@@ -2807,8 +2808,6 @@ void DrawEmptySummary(bool mcp_connection_dialog_open,
                     exit_confirmation);
   refresh();
 }
-
-bool ShouldExit(int ch) { return ch == 'q' || ch == 'Q'; }
 
 std::size_t CurrentNodeLogVisibleRows() {
   int rows = 0;
@@ -3370,7 +3369,7 @@ bool HandleInput(int ch, const std::filesystem::path& run_root,
       state->command_error.clear();
       return true;
     }
-    return ch != ERR && ch != 'q' && ch != 'Q';
+    return ch != ERR;
   }
 
   if (state->exit_confirmation.HandleInput(ch) !=
@@ -4111,9 +4110,6 @@ int RunTuiReportImpl(TuiRunSnapshotProvider snapshot_provider, bool once,
           continue;
         }
         break;
-      }
-      if (ShouldExit(ch)) {
-        return FinishTui(&state, 0);
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(sleep_step_ms));
       slept_ms += sleep_step_ms;

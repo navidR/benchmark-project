@@ -7,7 +7,7 @@ TuiExitConfirmationResult TuiExitConfirmation::HandleInput(int ch) {
     return TuiExitConfirmationResult::kIgnored;
   }
   if (!open_) {
-    if (ch != 27) {
+    if (ch != 27 && ch != 'q' && ch != 'Q') {
       return TuiExitConfirmationResult::kIgnored;
     }
     open_ = true;

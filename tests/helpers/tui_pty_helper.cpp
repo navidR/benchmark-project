@@ -1698,11 +1698,11 @@ void CheckPaletteOnErrorFrame(const std::filesystem::path& command,
   CorruptNextRefresh(run);
   static_cast<void>(
       process.ReadUntil("error:", 3s, "palette report-error frame"));
-  process.Write("x");
+  process.Write("q");
   if (process.ReadFor(500ms).empty()) {
     throw std::runtime_error("palette was not interactive on the error frame");
   }
-  process.Write("\x1bq");
+  process.Write("\x1bqy");
   RequireExitZero(&process, "palette report-error frame");
 }
 
@@ -1735,7 +1735,7 @@ void CheckCommandErrorOnErrorFrame(const std::filesystem::path& command,
   CorruptNextRefresh(run);
   static_cast<void>(
       process.ReadUntil("error:", 3s, "command-error report-error frame"));
-  process.Write("\x1bq");
+  process.Write("\x1bqy");
   RequireExitZero(&process, "command-error report-error frame");
 }
 
@@ -3998,9 +3998,11 @@ void CheckHomeEndKeys(const std::filesystem::path& command,
     blocks.emplace_back(boost::json::object{
         {"summary", summary},
         {"detail",
-         boost::json::object{{"block", summary},
-                             {"transactions", boost::json::array{}},
-                             {"byte_definition", "Captured test bytes"}}}});
+         boost::json::object{
+             {"block", summary},
+             {"transactions", boost::json::array{}},
+             {"byte_definition", std::string(780, 'x') + "Captured block " +
+                                     std::to_string(height) + " bytes"}}}});
   }
   {
     std::ofstream stream(run.run_root() / "chain-blocks.json");
@@ -4039,6 +4041,23 @@ void CheckHomeEndKeys(const std::filesystem::path& command,
     RequireNotContains(process.ReadFor(100ms), "Confirm exit",
                        "chain navigation must not open exit");
   }
+  // A cancelled quit must retain the selected block, focused details pane,
+  // and scroll position, including when only that pane fits on screen.
+  process.Write("\033[H\n");
+  static_cast<void>(
+      process.ReadUntil("height: 0", 5s, "selected block details"));
+  process.Resize(12, 80);
+  static_cast<void>(process.ReadFor(100ms));
+  process.Write("\033[F");
+  static_cast<void>(process.ReadUntil("Captured block 0 bytes", 5s,
+                                      "scrolled block details"));
+  process.Write("q");
+  static_cast<void>(process.ReadUntil("Confirm exit", 5s, "q exit dialog"));
+  process.Write("n");
+  static_cast<void>(process.ReadUntil(
+      "Captured block 0 bytes", 5s, "cancel restores block, focus and scroll"));
+  process.Resize(45, 160);
+  process.Write("\177");
   process.Write("x\n\033[6~\177");
   RequireNotContains(process.ReadFor(100ms), "Confirm exit",
                      "detail and transaction navigation");
@@ -4057,7 +4076,7 @@ void CheckHomeEndKeys(const std::filesystem::path& command,
   process.Resize(12, 30);
   RequireNotContains(process.ReadFor(100ms), "Confirm exit",
                      "narrow pool view");
-  process.Write("q");
+  process.Write("qy");
   RequireExitZero(&process, "Home/End key TUI");
 }
 
@@ -4115,7 +4134,7 @@ void CheckSimulatorLogWrapping(const std::filesystem::path& command,
   RequireContains(resized, "'-maxconnections=1'",
                   "120x30 reflowed Firo-Qt command");
   RequireContains(resized, "'-upnp=0'", "120x30 reflowed Firo-Qt command");
-  process.Write("q");
+  process.Write("qy");
   RequireExitZero(&process, "simulator-log wrapping TUI");
 }
 
@@ -7197,7 +7216,7 @@ void CheckActiveRunLifecycle(const std::filesystem::path& command,
   static_cast<void>(process.ReadFor(100ms));
 
   static_cast<void>(process.ReadFor(100ms));
-  process.Write("\x1b");
+  process.Write("q");
   static_cast<void>(
       process.ReadUntil("Confirm exit", 3s, "active-run exit modal"));
   process.Write("n");
@@ -7211,12 +7230,12 @@ void CheckActiveRunLifecycle(const std::filesystem::path& command,
   RequireNotContains(after_cancel, "\"event\":\"run_finished\"",
                      "active-run cancel path");
   if (!process.Running() || !ProcessExists(daemon_pid)) {
-    throw std::runtime_error("Esc,n stopped the active worker or its daemon");
+    throw std::runtime_error("q,n stopped the active worker or its daemon");
   }
 
   StartBlockGenerationWorkloadForRunShutdown(run_id, run_root, home_directory,
                                              height_wait_shutdown_target);
-  process.Write("\x1b");
+  process.Write("Q");
   static_cast<void>(
       process.ReadUntil("Confirm exit", 3s, "active-run confirmed exit modal"));
   process.Write("y");
