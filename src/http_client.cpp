@@ -619,25 +619,34 @@ struct HttpClient::ConnectionPool {
   struct Endpoint {
     Endpoint() { idle.reserve(kPerEndpoint); }
     std::mutex mutex;
-    std::timed_mutex digest_mutex;
     std::condition_variable_any available;
     std::size_t active = 0U;
     std::vector<std::unique_ptr<JsonConnection>> idle;
   };
 
   struct Lease {
-    Endpoint& endpoint;
+    explicit Lease(Endpoint& value) : endpoint(&value) {}
+    Lease(const Lease&) = delete;
+    Lease& operator=(const Lease&) = delete;
+    Lease(Lease&& other) noexcept
+        : endpoint(std::exchange(other.endpoint, nullptr)),
+          connection(std::move(other.connection)) {}
+
+    Endpoint* endpoint;
     std::unique_ptr<JsonConnection> connection;
 
     ~Lease() {
-      {
-        std::lock_guard lock(endpoint.mutex);
-        if (connection) {
-          endpoint.idle.push_back(std::move(connection));
-        }
-        --endpoint.active;
+      if (endpoint == nullptr) {
+        return;
       }
-      endpoint.available.notify_one();
+      {
+        std::lock_guard lock(endpoint->mutex);
+        if (connection) {
+          endpoint->idle.push_back(std::move(connection));
+        }
+        --endpoint->active;
+      }
+      endpoint->available.notify_one();
     }
   };
 
@@ -650,30 +659,9 @@ struct HttpClient::ConnectionPool {
     return *entry;
   }
 
-  std::unique_lock<std::timed_mutex> LockDigest(
-      const RpcEndpoint& rpc, std::chrono::steady_clock::time_point deadline,
-      std::stop_token stop_token) {
-    std::unique_lock<std::timed_mutex> lock(For(rpc).digest_mutex,
-                                            std::defer_lock);
-    while (!lock.owns_lock()) {
-      if (stop_token.stop_requested()) {
-        throw SimulationCancelled();
-      }
-      const auto now = std::chrono::steady_clock::now();
-      if (now >= deadline) {
-        throw boost::system::system_error(
-            beast::error::timeout, "digest RPC serialization deadline expired");
-      }
-      static_cast<void>(lock.try_lock_until(
-          std::min(deadline, now + std::chrono::milliseconds(10))));
-    }
-    return lock;
-  }
-
-  HttpResponse Post(const RpcEndpoint& rpc, std::string_view path,
-                    std::string_view body, const std::string& authorization,
-                    std::chrono::steady_clock::time_point deadline,
-                    std::stop_token stop_token) {
+  Lease Acquire(const RpcEndpoint& rpc,
+                std::chrono::steady_clock::time_point deadline,
+                std::stop_token stop_token) {
     Endpoint* endpoint = &For(rpc);
     std::unique_lock lock(endpoint->mutex);
     const bool admitted = endpoint->available.wait_until(
@@ -687,12 +675,20 @@ struct HttpClient::ConnectionPool {
                                         "HTTP JSON admission deadline expired");
     }
     ++endpoint->active;
-    Lease lease{*endpoint, nullptr};
+    Lease lease(*endpoint);
     if (!endpoint->idle.empty()) {
       lease.connection = std::move(endpoint->idle.back());
       endpoint->idle.pop_back();
     }
     lock.unlock();
+    return lease;
+  }
+
+  HttpResponse Post(const RpcEndpoint& rpc, std::string_view path,
+                    std::string_view body, const std::string& authorization,
+                    std::chrono::steady_clock::time_point deadline,
+                    std::stop_token stop_token) {
+    Lease lease = Acquire(rpc, deadline, stop_token);
     try {
       if (!lease.connection || !lease.connection->Reusable()) {
         lease.connection = std::make_unique<JsonConnection>(rpc, deadline);
@@ -751,46 +747,60 @@ HttpResponse HttpClient::PostJsonWithDeadline(
                               stop_token);
   }
 
-  const std::unique_lock<std::timed_mutex> lock =
-      connections_->LockDigest(endpoint, deadline, stop_token);
-  JsonConnection connection(endpoint, deadline);
-  connection.Connect(stop_token);
-  HttpExchange challenge_response =
-      connection.Send(path, body, std::nullopt, stop_token);
-  if (challenge_response.response.status != 401) {
-    throw std::runtime_error(
-        "RPC digest endpoint accepted a request without authentication");
-  }
+  ConnectionPool::Lease connection =
+      connections_->Acquire(endpoint, deadline, stop_token);
+  try {
+    if (!connection.connection || !connection.connection->Reusable()) {
+      connection.connection =
+          std::make_unique<JsonConnection>(endpoint, deadline);
+      connection.connection->Connect(stop_token);
+    } else {
+      connection.connection->SetDeadline(deadline);
+    }
+    HttpExchange challenge_response =
+        connection.connection->Send(path, body, std::nullopt, stop_token);
+    if (challenge_response.response.status != 401) {
+      throw std::runtime_error(
+          "RPC digest endpoint accepted a request without authentication");
+    }
 
-  DigestChallenge challenge =
-      SelectDigestChallenge(challenge_response.authentication_challenges);
-  for (std::uint32_t attempt = 0U; attempt < 2U; ++attempt) {
-    HttpExchange authenticated = connection.Send(
-        path, body, DigestAuthorization(credentials, challenge, path),
-        stop_token);
-    if (authenticated.response.status != 401) {
-      return authenticated.response;
+    DigestChallenge challenge =
+        SelectDigestChallenge(challenge_response.authentication_challenges);
+    for (std::uint32_t attempt = 0U; attempt < 2U; ++attempt) {
+      HttpExchange authenticated = connection.connection->Send(
+          path, body, DigestAuthorization(credentials, challenge, path),
+          stop_token);
+      if (authenticated.response.status != 401) {
+        HttpResponse response = std::move(authenticated.response);
+        if (!connection.connection->Reusable()) {
+          connection.connection.reset();
+        }
+        return response;
+      }
+      if (attempt == 0U) {
+        DigestChallenge refreshed =
+            SelectDigestChallenge(authenticated.authentication_challenges);
+        if (!refreshed.stale) {
+          throw std::runtime_error(
+              "RPC digest authentication was rejected without a stale "
+              "challenge");
+        }
+        if (refreshed.realm != challenge.realm) {
+          throw std::runtime_error(
+              "RPC digest authentication stale challenge changed realm");
+        }
+        if (refreshed.nonce == challenge.nonce) {
+          throw std::runtime_error(
+              "RPC digest authentication stale challenge reused its nonce");
+        }
+        challenge = std::move(refreshed);
+      }
     }
-    if (attempt == 0U) {
-      DigestChallenge refreshed =
-          SelectDigestChallenge(authenticated.authentication_challenges);
-      if (!refreshed.stale) {
-        throw std::runtime_error(
-            "RPC digest authentication was rejected without a stale "
-            "challenge");
-      }
-      if (refreshed.realm != challenge.realm) {
-        throw std::runtime_error(
-            "RPC digest authentication stale challenge changed realm");
-      }
-      if (refreshed.nonce == challenge.nonce) {
-        throw std::runtime_error(
-            "RPC digest authentication stale challenge reused its nonce");
-      }
-      challenge = std::move(refreshed);
-    }
+    throw std::runtime_error("RPC digest authentication was rejected");
+  } catch (...) {
+    connection.connection.reset();
+    throw;
   }
-  throw std::runtime_error("RPC digest authentication was rejected");
 }
 
 }  // namespace bbp

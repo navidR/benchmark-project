@@ -465,8 +465,7 @@ BOOST_AUTO_TEST_CASE(http_client_per_call_deadline_bounds_a_silent_server) {
   BOOST_TEST(elapsed.count() < 250);
 }
 
-BOOST_AUTO_TEST_CASE(
-    http_client_digest_serialization_wait_observes_cancellation) {
+BOOST_AUTO_TEST_CASE(http_client_bounds_digest_pressure_and_admission_waits) {
   namespace asio = boost::asio;
   namespace beast = boost::beast;
   namespace http = beast::http;
@@ -475,29 +474,36 @@ BOOST_AUTO_TEST_CASE(
   asio::io_context context;
   tcp::acceptor acceptor(
       context, tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0U));
-  std::promise<void> request_received;
+  std::promise<void> requests_received;
   std::future<void> server = std::async(std::launch::async, [&] {
-    tcp::socket socket(acceptor.get_executor());
-    acceptor.accept(socket);
-    beast::flat_buffer buffer;
-    http::request<http::string_body> request;
-    http::read(socket, buffer, request);
-    request_received.set_value();
+    std::vector<tcp::socket> sockets;
+    sockets.reserve(4U);
+    for (std::size_t request_index = 0U; request_index < 4U; ++request_index) {
+      sockets.emplace_back(acceptor.get_executor());
+      acceptor.accept(sockets.back());
+      beast::flat_buffer buffer;
+      http::request<http::string_body> request;
+      http::read(sockets.back(), buffer, request);
+    }
+    requests_received.set_value();
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
   });
 
   const bbp::HttpClient client(std::chrono::seconds(1));
   const bbp::RpcEndpoint endpoint =
       DigestEndpoint(acceptor.local_endpoint().port());
-  std::future<bool> lock_owner = std::async(std::launch::async, [&] {
-    try {
-      static_cast<void>(client.PostJson(endpoint, "/", "{}"));
-    } catch (const std::exception&) {
-      return true;
-    }
-    return false;
-  });
-  BOOST_REQUIRE(request_received.get_future().wait_for(
+  std::vector<std::future<bool>> admitted;
+  for (std::size_t request_index = 0U; request_index < 4U; ++request_index) {
+    admitted.push_back(std::async(std::launch::async, [&] {
+      try {
+        static_cast<void>(client.PostJson(endpoint, "/", "{}"));
+      } catch (const std::exception&) {
+        return true;
+      }
+      return false;
+    }));
+  }
+  BOOST_REQUIRE(requests_received.get_future().wait_for(
                     std::chrono::seconds(1)) == std::future_status::ready);
 
   std::stop_source stop_source;
@@ -520,7 +526,9 @@ BOOST_AUTO_TEST_CASE(
               std::chrono::milliseconds(250));
 
   server.get();
-  BOOST_TEST(lock_owner.get());
+  for (std::future<bool>& request : admitted) {
+    BOOST_TEST(request.get());
+  }
 }
 
 BOOST_AUTO_TEST_CASE(

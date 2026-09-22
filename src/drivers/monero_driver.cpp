@@ -219,11 +219,8 @@ std::vector<std::string> ParsePeerAddresses(const boost::json::object& result,
       throw std::runtime_error(
           "Monero RPC get_connections returned an unknown protocol state");
     }
-    if (!exact_addresses.insert(address).second) {
-      throw std::runtime_error(
-          "Monero RPC get_connections returned a duplicate address");
-    }
-    if (!require_completed_handshake || state != "before_handshake") {
+    if ((!require_completed_handshake || state != "before_handshake") &&
+        exact_addresses.insert(address).second) {
       addresses.push_back(std::move(address));
     }
   }

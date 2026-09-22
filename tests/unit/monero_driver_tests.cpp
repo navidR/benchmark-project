@@ -827,10 +827,11 @@ BOOST_AUTO_TEST_CASE(monero_driver_rejects_malformed_peer_arrays) {
       PeerAddressesResponse(JsonRpcResult(
           R"({"status":"OK","connections":[{"address":"not-an-endpoint","state":"normal"}]})")),
       std::runtime_error);
-  BOOST_CHECK_THROW(
-      PeerAddressesResponse(JsonRpcResult(
-          R"({"status":"OK","connections":[{"address":"10.210.1.6:18080","state":"normal"},{"address":"10.210.1.6:18080","state":"normal"}]})")),
-      std::runtime_error);
+  const std::vector<std::string> deduplicated = PeerAddressesResponse(
+      JsonRpcResult(
+          R"({"status":"OK","connections":[{"address":"10.210.1.6:18080","state":"normal"},{"address":"10.210.1.6:18080","state":"normal"}]})"));
+  BOOST_REQUIRE_EQUAL(deduplicated.size(), 1U);
+  BOOST_TEST(deduplicated.front() == "10.210.1.6:18080");
   BOOST_CHECK_THROW(
       PeerAddressesResponse(JsonRpcResult(
           R"({"status":"OK","connections":[{"address":"10.210.1.6:18080"}]})")),
