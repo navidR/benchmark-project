@@ -10,6 +10,8 @@
 #include <ncursesw/term.h>
 // clang-format on
 
+#include <poll.h>
+
 #include <algorithm>
 #include <boost/algorithm/string/join.hpp>
 #include <boost/json/array.hpp>
@@ -4087,8 +4089,10 @@ int RunTuiReportImpl(TuiRunSnapshotProvider snapshot_provider, bool once,
 
     const std::uint32_t refresh_wait_ms =
         report_has_backlog ? sleep_step_ms : refresh_ms;
-    std::uint32_t slept_ms = 0;
-    while (slept_ms < refresh_wait_ms) {
+    const auto refresh_deadline = std::chrono::steady_clock::now() +
+                                  std::chrono::milliseconds(refresh_wait_ms);
+    auto input_wait_deadline = std::chrono::steady_clock::now();
+    while (std::chrono::steady_clock::now() < refresh_deadline) {
       if (stop_token.stop_requested()) {
         return FinishTui(&state, 0);
       }
@@ -4126,8 +4130,25 @@ int RunTuiReportImpl(TuiRunSnapshotProvider snapshot_provider, bool once,
         }
         break;
       }
-      std::this_thread::sleep_for(std::chrono::milliseconds(sleep_step_ms));
-      slept_ms += sleep_step_ms;
+      // EOF or an unusable terminal can stay ready without yielding a key.
+      if (ch == ERR && std::chrono::steady_clock::now() < input_wait_deadline) {
+        std::this_thread::sleep_until(input_wait_deadline);
+        continue;
+      }
+      const auto wait_start = std::chrono::steady_clock::now();
+      if (wait_start >= refresh_deadline) {
+        break;
+      }
+      input_wait_deadline =
+          std::min(refresh_deadline,
+                   wait_start + std::chrono::milliseconds(sleep_step_ms));
+      const int wait_ms =
+          static_cast<int>(std::chrono::ceil<std::chrono::milliseconds>(
+                               input_wait_deadline - wait_start)
+                               .count());
+      pollfd input{fileno(stdin), POLLIN, 0};
+      // Recheck run state before reading input, including after poll errors.
+      static_cast<void>(poll(&input, 1, wait_ms));
     }
   }
 }
