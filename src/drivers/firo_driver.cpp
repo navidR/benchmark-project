@@ -248,7 +248,7 @@ boost::json::value ParseRpcResponse(std::string_view body,
                              std::string(method) +
                              " returned a non-object response");
   }
-  const boost::json::object& object = value.as_object();
+  boost::json::object& object = value.as_object();
   const boost::json::value* error = object.if_contains("error");
   if (error == nullptr) {
     throw std::runtime_error(std::string(driver_name) + " RPC " +
@@ -280,13 +280,13 @@ boost::json::value ParseRpcResponse(std::string_view body,
         *parsed_code, std::string(driver_name) + " RPC " + std::string(method) +
                           " returned error: " + std::string(body));
   }
-  const boost::json::value* result = object.if_contains("result");
+  boost::json::value* result = object.if_contains("result");
   if (result == nullptr) {
     throw std::runtime_error(std::string(driver_name) + " RPC " +
                              std::string(method) +
                              " returned no result: " + std::string(body));
   }
-  return *result;
+  return std::move(*result);
 }
 
 std::vector<std::string> ParseStringArrayResult(const boost::json::value& value,

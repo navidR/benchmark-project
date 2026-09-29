@@ -1030,12 +1030,12 @@ boost::json::object MoneroDriver::JsonRpcCall(
                              std::to_string(response.status) + " for " +
                              std::string(method));
   }
-  const boost::json::value parsed = boost::json::parse(response.body);
+  boost::json::value parsed = boost::json::parse(response.body);
   if (!parsed.is_object()) {
     throw std::runtime_error("Monero JSON-RPC " + std::string(method) +
                              " returned a non-object response");
   }
-  const boost::json::object& envelope = parsed.as_object();
+  boost::json::object& envelope = parsed.as_object();
   const boost::json::value* error = envelope.if_contains("error");
   if (error != nullptr && !error->is_null()) {
     if (!error->is_object()) {
@@ -1048,12 +1048,12 @@ boost::json::object MoneroDriver::JsonRpcCall(
     throw std::runtime_error("Monero JSON-RPC " + std::string(method) +
                              " returned error: " + message);
   }
-  const boost::json::value* result = envelope.if_contains("result");
+  boost::json::value* result = envelope.if_contains("result");
   if (result == nullptr || !result->is_object()) {
     throw std::runtime_error("Monero JSON-RPC " + std::string(method) +
                              " returned no result object");
   }
-  boost::json::object output = result->as_object();
+  boost::json::object output = std::move(*result).as_object();
   RequireOkStatus(output, method);
   return output;
 }
@@ -1068,12 +1068,12 @@ boost::json::object MoneroDriver::PlainRpcCall(
                              std::to_string(response.status) + " for " +
                              std::string(path));
   }
-  const boost::json::value parsed = boost::json::parse(response.body);
+  boost::json::value parsed = boost::json::parse(response.body);
   if (!parsed.is_object()) {
     throw std::runtime_error("Monero RPC " + std::string(path) +
                              " returned a non-object response");
   }
-  boost::json::object output = parsed.as_object();
+  boost::json::object output = std::move(parsed).as_object();
   RequireOkStatus(output, path);
   return output;
 }
