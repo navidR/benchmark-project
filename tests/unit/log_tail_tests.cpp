@@ -119,12 +119,13 @@ BOOST_AUTO_TEST_CASE(log_tail_returns_empty_for_missing_file) {
 BOOST_AUTO_TEST_CASE(recent_log_view_reads_only_the_requested_tail_lines) {
   const std::filesystem::path dir = MakeTestDir("recent-log-view");
   const std::filesystem::path log = dir / "simulator.log";
+  const std::string second = "second " + std::string(24U * 1024U, 's') + " end";
   std::string contents(128U * 1024U, 'x');
-  contents += "\nfirst\nsecond\nthird\nfourth";
+  contents += "\nfirst\n" + second + "\nthird\nfourth";
   bbp::WriteText(log, contents);
 
   const std::vector<std::string> lines = bbp::ReadRecentLogLines(log, 3U);
-  const std::vector<std::string> expected = {"second", "third", "fourth"};
+  const std::vector<std::string> expected = {second, "third", "fourth"};
   BOOST_TEST(lines == expected, boost::test_tools::per_element());
   BOOST_TEST(bbp::ReadRecentLogLines(log, 0U).empty());
 

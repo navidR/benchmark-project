@@ -51,8 +51,11 @@ std::vector<std::string> ReadRecentLogLines(
     }
     newline_count += static_cast<std::size_t>(
         std::count(buffer.begin(), buffer.begin() + bytes, '\n'));
-    tail.insert(0, buffer.data(), static_cast<std::size_t>(bytes));
+    // Assemble in reverse byte order without repeatedly shifting the tail.
+    std::reverse(buffer.begin(), buffer.begin() + bytes);
+    tail.append(buffer.data(), static_cast<std::size_t>(bytes));
   }
+  std::reverse(tail.begin(), tail.end());
   if (begin > 0) {
     const std::size_t first_newline = tail.find('\n');
     if (first_newline == std::string::npos) {
