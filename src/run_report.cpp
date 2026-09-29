@@ -3108,7 +3108,7 @@ struct IncrementalRunReport::Impl {
       }
       const std::uint64_t next_line_number = cursor->line_number + 1U;
       if (!line.empty()) {
-        const boost::json::object object =
+        boost::json::object object =
             ParseJsonObjectLine(path, line, next_line_number);
         summaries_dirty = true;
         callback(object);
@@ -3918,7 +3918,7 @@ struct IncrementalRunReport::Impl {
     RememberNodeMetricSample(metric, &node);
   }
 
-  void ProcessWalletMetric(const boost::json::object& metric) {
+  void ProcessWalletMetric(boost::json::object metric) {
     RequireMatchingRunId(metric, "wallet metric");
     const std::optional<std::uint64_t> wallet_index =
         OptionalUint64Field(metric, "wallet_index");
@@ -3938,7 +3938,7 @@ struct IncrementalRunReport::Impl {
     wallet.wallet_index = *wallet_index;
     CopyOptionalUint64Field(metric, "node", &wallet.node);
     CopyOptionalWalletModeField(metric, "mode", &wallet);
-    wallet.last_metrics = metric;
+    wallet.last_metrics = std::move(metric);
   }
 
   void RecoverCapacityFromManifest(std::stop_token stop_token) {
@@ -4161,8 +4161,8 @@ struct IncrementalRunReport::Impl {
     const bool wallet_metric_backlog =
         ConsumeFile(run_root / "wallet-metrics.jsonl", &wallet_metric_cursor,
                     maximum_records_per_file, &stats.wallet_metric_records,
-                    stop_token, [this](const boost::json::object& metric) {
-                      ProcessWalletMetric(metric);
+                    stop_token, [this](boost::json::object& metric) {
+                      ProcessWalletMetric(std::move(metric));
                     });
     stats.has_backlog =
         event_backlog || metric_backlog || wallet_metric_backlog;
