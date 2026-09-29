@@ -142,6 +142,15 @@ void SimulatorLogPane::Refresh(const std::vector<std::string>& records,
                                std::size_t content_width,
                                std::size_t visible_rows,
                                const std::vector<std::string>& operator_argv) {
+  if (content_width_ == content_width && records_ == records &&
+      operator_argv_ == operator_argv) {
+    visible_rows_ = visible_rows;
+    first_visible_row_ =
+        follow_tail_ ? MaximumFirstVisibleRow()
+                     : std::min(first_visible_row_, MaximumFirstVisibleRow());
+    return;
+  }
+
   std::optional<VisualRowAnchor> anchor;
   if (!follow_tail_ && first_visible_row_ < rows_.size()) {
     const SimulatorLogVisualRow& row = rows_[first_visible_row_];
@@ -154,8 +163,12 @@ void SimulatorLogPane::Refresh(const std::vector<std::string>& records,
     }
   }
 
+  // A failed rebuild must not make the next refresh reuse stale rows.
+  content_width_.reset();
   records_ = records;
   rows_ = WrapRecords(records_, content_width, operator_argv);
+  operator_argv_ = operator_argv;
+  content_width_ = content_width;
   visible_rows_ = visible_rows;
   if (follow_tail_) {
     first_visible_row_ = MaximumFirstVisibleRow();

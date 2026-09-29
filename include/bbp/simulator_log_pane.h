@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -36,6 +37,8 @@ class SimulatorLogPane {
 
   std::vector<std::string> records_;
   std::vector<SimulatorLogVisualRow> rows_;
+  std::vector<std::string> operator_argv_;
+  std::optional<std::size_t> content_width_;
   std::size_t visible_rows_ = 0U;
   std::size_t first_visible_row_ = 0U;
   bool follow_tail_ = true;
