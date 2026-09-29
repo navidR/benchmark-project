@@ -83,7 +83,8 @@ def main():
         status = Path(f"/proc/{process.pid}/status").read_text().splitlines()
         result["peak_rss_kib"] = int(next(
             line for line in status if line.startswith("VmHWM:")).split()[1])
-        os.write(master, b"q")
+        # Request quit and explicitly confirm the TUI exit dialog.
+        os.write(master, b"qy")
         process.wait(timeout=15)
     finally:
         try:
