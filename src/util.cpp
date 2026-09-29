@@ -498,7 +498,11 @@ std::vector<std::string> SplitWhitespace(std::string_view text) {
 
 std::string JsonString(const boost::json::value& value,
                        std::string_view field) {
-  const auto& object = value.as_object();
+  return JsonString(value.as_object(), field);
+}
+
+std::string JsonString(const boost::json::object& object,
+                       std::string_view field) {
   const boost::json::value* found = object.if_contains(field);
   if (found == nullptr || !found->is_string()) {
     throw std::runtime_error("missing JSON string field: " +
@@ -508,7 +512,10 @@ std::string JsonString(const boost::json::value& value,
 }
 
 uint64_t JsonUint(const boost::json::value& value, std::string_view field) {
-  const auto& object = value.as_object();
+  return JsonUint(value.as_object(), field);
+}
+
+uint64_t JsonUint(const boost::json::object& object, std::string_view field) {
   const boost::json::value* found = object.if_contains(field);
   if (found == nullptr) {
     throw std::runtime_error("missing JSON uint field: " + std::string(field));

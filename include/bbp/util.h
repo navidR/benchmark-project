@@ -38,7 +38,10 @@ uint64_t JsonFixed8Amount(const boost::json::value& value,
                           std::string_view field);
 
 std::vector<std::string> SplitWhitespace(std::string_view text);
+std::string JsonString(const boost::json::object& object,
+                       std::string_view field);
 std::string JsonString(const boost::json::value& value, std::string_view field);
+uint64_t JsonUint(const boost::json::object& object, std::string_view field);
 uint64_t JsonUint(const boost::json::value& value, std::string_view field);
 std::optional<bool> JsonOptionalBool(const boost::json::value& value,
                                      std::string_view field);

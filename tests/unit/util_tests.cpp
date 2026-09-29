@@ -20,8 +20,24 @@ BOOST_AUTO_TEST_CASE(json_field_helpers_read_boost_values) {
   object["blocks"] = 7;
   object["bestblockhash"] = "abc";
 
-  BOOST_TEST(bbp::JsonUint(object, "blocks") == 7U);
-  BOOST_TEST(bbp::JsonString(object, "bestblockhash") == "abc");
+  const auto check_fields = [](const auto& input) {
+    BOOST_TEST(bbp::JsonUint(input, "blocks") == 7U);
+    BOOST_TEST(bbp::JsonString(input, "bestblockhash") == "abc");
+    BOOST_CHECK_THROW(bbp::JsonUint(input, "missing"), std::runtime_error);
+    BOOST_CHECK_THROW(bbp::JsonString(input, "missing"), std::runtime_error);
+  };
+  check_fields(object);
+  check_fields(boost::json::value(object));
+
+  object["blocks"] = -1;
+  object["bestblockhash"] = false;
+  const auto check_invalid_fields = [](const auto& input) {
+    BOOST_CHECK_THROW(bbp::JsonUint(input, "blocks"), std::runtime_error);
+    BOOST_CHECK_THROW(bbp::JsonString(input, "bestblockhash"),
+                      std::runtime_error);
+  };
+  check_invalid_fields(object);
+  check_invalid_fields(boost::json::value(object));
 }
 
 BOOST_AUTO_TEST_CASE(split_whitespace_reads_cgroup_controller_lists) {
