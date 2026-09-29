@@ -171,9 +171,34 @@ BOOST_AUTO_TEST_CASE(chain_view_bound_source_failure_and_pruning) {
   BOOST_TEST(page.at("source_node").as_string() == "two");
   BOOST_TEST(page.at("notice").as_string().find("one -> two") !=
              boost::json::string::npos);
-  const auto records =
+  auto records =
       boost::json::parse(bbp::ReadText(f.root / "chain-blocks.json"));
   BOOST_TEST(records.as_object().at("records").as_array().size() <= 64U);
+
+  service.Close();
+  for (auto& record : records.as_object().at("records").as_array()) {
+    auto& detail = record.as_object().at("detail");
+    if (!detail.is_object()) continue;
+    detail.as_object()
+        .at("byte_definition")
+        .as_string()
+        .append(bbp::ChainViewService::kMaximumDetailBytes -
+                    boost::json::serialize(detail).size(),
+                'x');
+  }
+  bbp::WriteText(f.root / "chain-blocks.json", boost::json::serialize(records));
+  bbp::ChainViewService growing(f.root, f.Readers());
+  const auto selected = f.tip.load();
+  page = growing.Query(
+      {.first_height = selected, .selected_height = selected, .limit = 1});
+  BOOST_REQUIRE(page.at("detail").is_object());
+  // A successor hash grows a previously valid detail beyond the output bound.
+  ++f.tip;
+  page = growing.Query(
+      {.first_height = selected, .selected_height = selected, .limit = 1});
+  BOOST_TEST(page.at("detail").is_null());
+  BOOST_TEST(page.at("detail_error").as_string() ==
+             "block detail exceeds 2 MiB display limit");
 }
 
 // Exercise the same selection and asynchronous reader used by curses, with

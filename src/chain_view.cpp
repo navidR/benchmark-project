@@ -334,6 +334,10 @@ boost::json::object ChainViewService::Query(const ChainViewRequest& request,
                 reader->summary(selected + 1, stop).hash;
           else
             entry->detail.at("block").as_object()["next_hash"] = nullptr;
+          if (boost::json::serialize(entry->detail).size() >
+              kMaximumDetailBytes)
+            throw std::runtime_error(
+                "block detail exceeds 2 MiB display limit");
         }
         result["detail"] = entry->detail;
       } else
