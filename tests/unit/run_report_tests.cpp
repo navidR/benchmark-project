@@ -2901,6 +2901,11 @@ BOOST_AUTO_TEST_CASE(incremental_run_report_replays_atomically_replaced_input) {
   const boost::json::object& replayed = incremental.Refresh();
   BOOST_TEST(JsonInteger(replayed, "event_count") == 2U);
   BOOST_TEST(bbp::JsonString(replayed, "status") == "finished");
+  // An empty replacement must still invalidate a frontend's last snapshot.
+  bbp::WriteText(replacement, "");
+  std::filesystem::rename(replacement, dir / "events.jsonl");
+  BOOST_TEST(JsonInteger(incremental.Refresh(), "event_count") == 0U);
+  BOOST_TEST(incremental.last_refresh_stats().report_changed);
   std::filesystem::remove_all(dir);
 }
 
@@ -2939,6 +2944,7 @@ BOOST_AUTO_TEST_CASE(incremental_run_report_recovers_manifest_only_changes) {
       R"({"run_id":"manifest-refresh","node_id":"firo-1","timestamp_ms":1})");
   bbp::IncrementalRunReport incremental(dir);
   BOOST_TEST(incremental.Refresh().at("nodes_summary").as_array().size() == 1U);
+  BOOST_TEST(incremental.last_refresh_stats().report_changed);
 
   // Recovery must invalidate summaries even when no JSONL record arrived.
   manifest.nodes.clear();
@@ -2946,9 +2952,11 @@ BOOST_AUTO_TEST_CASE(incremental_run_report_recovers_manifest_only_changes) {
   bbp::WriteRuntimeNodeResourceManifest(manifest);
   const auto& recovered = incremental.Refresh();
   BOOST_TEST(incremental.last_refresh_stats().event_records == 0U);
+  BOOST_TEST(incremental.last_refresh_stats().report_changed);
   BOOST_TEST(JsonInteger(recovered, "node_capacity") == 2U);
   BOOST_TEST(recovered.at("nodes_summary").as_array().empty());
   BOOST_TEST(!recovered.at("inventory_publication_complete").as_bool());
   BOOST_TEST(incremental.Refresh() == bbp::BuildRunReport(dir));
+  BOOST_TEST(!incremental.last_refresh_stats().report_changed);
   std::filesystem::remove_all(dir);
 }

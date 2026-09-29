@@ -4077,6 +4077,7 @@ struct IncrementalRunReport::Impl {
     report["nodes_summary"] = NodesJson(nodes);
     AddTopologyViewSummaries(&report);
     summaries_dirty = false;
+    stats.report_changed = true;
   }
 
   void RecordScheduledBlockTransactions(const boost::json::object& event) {
@@ -4140,11 +4141,11 @@ struct IncrementalRunReport::Impl {
   const boost::json::object& Refresh(std::size_t maximum_records_per_file,
                                      std::stop_token stop_token) {
     ThrowIfReportCancelled(stop_token);
+    stats = {};
     if (ScenarioFileChanged() || AnyInputFileWasReplaced()) {
       Reset(stop_token);
     }
     ThrowIfReportCancelled(stop_token);
-    stats = {};
     const bool event_backlog = ConsumeFile(
         run_root / "events.jsonl", &event_cursor, maximum_records_per_file,
         &stats.event_records, stop_token,

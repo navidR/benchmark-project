@@ -25,6 +25,8 @@ struct RunReportRefreshStats {
   std::uint64_t metric_records = 0;
   std::uint64_t wallet_metric_records = 0;
   bool has_backlog = false;
+  // Includes report rebuilds after input replacement or manifest recovery.
+  bool report_changed = false;
 };
 
 class IncrementalRunReport {

@@ -3771,6 +3771,7 @@ struct TuiReportRefreshResult {
   std::vector<std::string> log_lines;
   std::string error;
   bool has_backlog = false;
+  bool report_unchanged = false;
   bool cancelled = false;
 };
 
@@ -3791,6 +3792,7 @@ class TuiReportRefreshTask {
 
   void Start(const TuiRunSnapshot& snapshot,
              std::unique_ptr<IncrementalRunReport> live_report,
+             bool require_report_snapshot,
              std::stop_token application_stop_token) {
     if (Active()) {
       throw std::logic_error("TUI report refresh is already active");
@@ -3799,7 +3801,8 @@ class TuiReportRefreshTask {
     const std::shared_ptr<std::stop_source> stop_source = stop_source_;
     future_ = std::async(
         std::launch::async, [snapshot, live_report = std::move(live_report),
-                             stop_source, application_stop_token]() mutable {
+                             require_report_snapshot, stop_source,
+                             application_stop_token]() mutable {
           TuiReportRefreshResult result;
           result.generation = snapshot.generation;
           result.run_root = snapshot.run_root;
@@ -3831,7 +3834,12 @@ class TuiReportRefreshTask {
             if (publication_lock.owns_lock()) {
               publication_lock.unlock();
             }
-            result.report = refreshed;
+            result.report_unchanged =
+                !require_report_snapshot &&
+                !live_report->last_refresh_stats().report_changed;
+            if (!result.report_unchanged) {
+              result.report = refreshed;
+            }
             if (!refresh_stop_token.stop_requested()) {
               result.log_lines =
                   ReadRecentLogLines(RunLogPath(snapshot.run_root), 256U);
@@ -3943,6 +3951,7 @@ int RunTuiReportImpl(TuiRunSnapshotProvider snapshot_provider, bool once,
   std::string error;
   bool report_has_backlog = false;
   bool report_initialized = false;
+  bool require_report_snapshot = true;
 
   const auto update_snapshot = [&](TuiRunSnapshot next_snapshot) {
     const bool run_changed = !snapshot ||
@@ -3956,6 +3965,7 @@ int RunTuiReportImpl(TuiRunSnapshotProvider snapshot_provider, bool once,
       error.clear();
       report_has_backlog = false;
       report_initialized = false;
+      require_report_snapshot = true;
       ResetRunUiState(&state);
 #ifdef BBP_FIRO_GUI_LAUNCHER
       state.operator_connection_launcher =
@@ -3985,9 +3995,13 @@ int RunTuiReportImpl(TuiRunSnapshotProvider snapshot_provider, bool once,
       if (refreshed.generation == snapshot->generation &&
           refreshed.run_root == snapshot->run_root) {
         live_report = std::move(refreshed.live_report);
+        require_report_snapshot =
+            refreshed.cancelled || !refreshed.error.empty();
         if (!refreshed.cancelled) {
           report_initialized = true;
-          report = std::move(refreshed.report);
+          if (!refreshed.report_unchanged) {
+            report = std::move(refreshed.report);
+          }
           log_lines = std::move(refreshed.log_lines);
           error = std::move(refreshed.error);
           report_has_backlog = refreshed.has_backlog;
@@ -3995,7 +4009,8 @@ int RunTuiReportImpl(TuiRunSnapshotProvider snapshot_provider, bool once,
       }
     }
     if (has_active_run && !refresh_task.Active() && !refresh_completed) {
-      refresh_task.Start(*snapshot, std::move(live_report), stop_token);
+      refresh_task.Start(*snapshot, std::move(live_report),
+                         require_report_snapshot, stop_token);
       if (once || !report_initialized) {
         refresh_task.Wait();
         continue;
