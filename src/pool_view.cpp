@@ -90,6 +90,7 @@ boost::json::object PoolViewService::Query(const PoolViewRequest& request,
   }
   std::optional<PoolReader> reader;
   ChainPoolSnapshot snapshot;
+  std::size_t snapshot_bytes = 0;
   const std::string previous_source =
       captured_.empty() ? "" : JsonString(captured_, "source_node");
   if (!live && request.source_node) {
@@ -149,7 +150,8 @@ boost::json::object PoolViewService::Query(const PoolViewRequest& request,
                              {"summary", PoolSummaryJson(snapshot.summary)},
                              {"transactions", std::move(entries)},
                              {"detail", nullptr}};
-    if (boost::json::serialize(next).size() > kMaximumBytes)
+    snapshot_bytes = boost::json::serialize(next).size();
+    if (snapshot_bytes > kMaximumBytes)
       throw std::runtime_error("normalized pool exceeds 32 MiB display bound");
     captured_ = std::move(next);
     loaded_ = true;
@@ -211,8 +213,7 @@ boost::json::object PoolViewService::Query(const PoolViewRequest& request,
         if (detail.id != selected)
           throw std::runtime_error("pool detail identity mismatch");
         auto detail_json = PoolTransactionJson(detail);
-        if (boost::json::serialize(captured_).size() +
-                boost::json::serialize(detail_json).size() >
+        if (snapshot_bytes + boost::json::serialize(detail_json).size() >
             kMaximumBytes)
           throw std::runtime_error(
               "selected pool detail exceeds capture bound");
