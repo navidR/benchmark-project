@@ -84,6 +84,7 @@ void ChainViewService::Load(std::stop_token stop) {
     entry.summary = ParseSummary(o.at("summary").as_object());
     entry.used = ++used_;
     if (const auto* d = o.if_contains("detail"); d && d->is_object()) {
+      detail_bounds_dirty_ = true;
       entry.detail = d->as_object();
       const auto summary = ParseSummary(entry.detail.at("block").as_object());
       if (summary.height != entry.summary.height ||
@@ -130,6 +131,7 @@ void ChainViewService::Trim() {
     entries_.erase(oldest);
     dirty_ = true;
   }
+  if (!detail_bounds_dirty_) return;
   std::vector<Entry*> details;
   for (auto& [height, e] : entries_) {
     static_cast<void>(height);
@@ -146,6 +148,7 @@ void ChainViewService::Trim() {
     } else
       bytes += size;
   }
+  detail_bounds_dirty_ = false;
 }
 
 void ChainViewService::UpdateTip(ChainBlockReader& reader,
@@ -316,12 +319,14 @@ boost::json::object ChainViewService::Query(const ChainViewRequest& request,
         auto json = ChainBlockDetailJson(detail);
         if (boost::json::serialize(json).size() > kMaximumDetailBytes)
           throw std::runtime_error("block detail exceeds 2 MiB display limit");
+        detail_bounds_dirty_ = true;
         entry->detail = std::move(json);
         dirty_ = true;
         Trim();
       }
       if (!entry->detail.empty()) {
         if (reader) {
+          detail_bounds_dirty_ = true;
           entry->detail.at("block").as_object()["confirmations"] =
               ChainBlockSummaryJson(entry->summary).at("confirmations");
           if (selected < tip_->height)

@@ -68,6 +68,7 @@ class ChainViewService {
   std::uint64_t used_ = 0;
   bool loaded_ = false;
   bool dirty_ = false;
+  bool detail_bounds_dirty_ = true;
 };
 
 }  // namespace bbp

@@ -138,6 +138,7 @@ BOOST_AUTO_TEST_CASE(chain_view_lazy_reorg_and_retained_records) {
 // source visibly, and unavailable blocks do not poison other rows.
 BOOST_AUTO_TEST_CASE(chain_view_bound_source_failure_and_pruning) {
   ChainFixture f;
+  f.transaction_count = 2000;
   bbp::ChainViewService service(f.root, f.Readers());
   for (std::uint64_t height = 0; height < 140; height += 16) {
     auto page = service.Query(
@@ -153,6 +154,18 @@ BOOST_AUTO_TEST_CASE(chain_view_bound_source_failure_and_pruning) {
                      .as_string() == "block pruned");
     }
   }
+  // New dense details must invalidate the previously satisfied byte bound.
+  const auto dense_capture =
+      boost::json::parse(bbp::ReadText(f.root / "chain-blocks.json"));
+  std::size_t detail_bytes = 0;
+  for (const auto& record :
+       dense_capture.as_object().at("records").as_array()) {
+    const auto& detail = record.as_object().at("detail");
+    if (detail.is_object())
+      detail_bytes += boost::json::serialize(detail).size();
+  }
+  BOOST_TEST(detail_bytes > 0U);
+  BOOST_TEST(detail_bytes <= bbp::ChainViewService::kMaximumDetailBytes);
   f.first_healthy = false;
   auto page = service.Query({});
   BOOST_TEST(page.at("source_node").as_string() == "two");
