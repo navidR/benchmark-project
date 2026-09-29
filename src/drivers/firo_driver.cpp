@@ -1917,16 +1917,16 @@ ChainTransactionObservation FiroDriver::ObserveTransactionImpl(
   }
 
   const boost::json::value mempool =
-      rpc_call("getrawmempool", boost::json::array{});
-  if (!mempool.is_array()) {
+      rpc_call("getmempoolinfo", boost::json::array{});
+  if (!mempool.is_object()) {
     throw std::runtime_error(driver_name_ +
-                             " getrawmempool returned a non-array");
+                             " getmempoolinfo returned a non-object");
   }
 
   ChainTransactionObservation observation;
   observation.observed_height = observed_height;
   observation.mempool_size =
-      static_cast<std::uint64_t>(mempool.as_array().size());
+      JsonUint64Member(mempool.as_object(), "size", driver_name_);
 
   boost::json::array params;
   params.emplace_back(txid);

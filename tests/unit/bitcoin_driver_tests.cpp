@@ -245,7 +245,7 @@ BOOST_AUTO_TEST_CASE(
       tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0U));
   const std::vector<std::string> responses = {
       R"({"result":30,"error":null,"id":"bbp"})",
-      R"({"result":[],"error":null,"id":"bbp"})",
+      R"({"result":{"size":0},"error":null,"id":"bbp"})",
       R"({"result":{"txid":"confirmed-bitcoin-tx","blockhash":"bitcoin-block-29","confirmations":2,"time":1700000000,"blocktime":1700000000},"error":null,"id":"bbp"})",
       R"({"result":{"hash":"bitcoin-block-29","height":29,"confirmations":2},"error":null,"id":"bbp"})"};
   std::future<std::vector<boost::json::value>> served =
@@ -273,7 +273,7 @@ BOOST_AUTO_TEST_CASE(
   BOOST_TEST(observation.confirmations == 2U);
   BOOST_REQUIRE_EQUAL(requests.size(), 4U);
   const std::vector<std::string> expected_methods = {
-      "getblockcount", "getrawmempool", "getrawtransaction", "getblockheader"};
+      "getblockcount", "getmempoolinfo", "getrawtransaction", "getblockheader"};
   for (std::size_t index = 0U; index < expected_methods.size(); ++index) {
     BOOST_TEST(requests[index].as_object().at("method").as_string() ==
                expected_methods[index]);
@@ -303,7 +303,7 @@ BOOST_AUTO_TEST_CASE(bitcoin_rejects_invalid_confirmation_header_schemas) {
         tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0U));
     const std::vector<std::string> responses = {
         R"({"result":30,"error":null,"id":"bbp"})",
-        R"({"result":[],"error":null,"id":"bbp"})",
+        R"({"result":{"size":0},"error":null,"id":"bbp"})",
         R"({"result":{"txid":"invalid-bitcoin-tx","blockhash":"bitcoin-block-29","confirmations":2,"time":1700000000,"blocktime":1700000000},"error":null,"id":"bbp"})",
         header_response};
     std::future<std::vector<boost::json::value>> served =
@@ -359,7 +359,8 @@ BOOST_AUTO_TEST_CASE(bitcoin_rejects_invalid_transaction_confirmations) {
         tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0U));
     const std::vector<std::string> responses = {
         R"({"result":30,"error":null,"id":"bbp"})",
-        R"({"result":[],"error":null,"id":"bbp"})", transaction_response};
+        R"({"result":{"size":0},"error":null,"id":"bbp"})",
+        transaction_response};
     std::future<std::vector<boost::json::value>> served =
         std::async(std::launch::async,
                    [&] { return ServeRpcResponses(acceptor, responses); });

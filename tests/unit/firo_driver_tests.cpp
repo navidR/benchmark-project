@@ -1215,7 +1215,7 @@ BOOST_AUTO_TEST_CASE(firo_observes_mempool_transaction_with_exact_rpc_payload) {
       tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0U));
   const std::vector<std::string> responses = {
       R"({"result":25,"error":null,"id":"bbp"})",
-      R"({"result":["observed-tx","other-tx"],"error":null,"id":"bbp"})",
+      R"({"result":{"size":2},"error":null,"id":"bbp"})",
       R"({"result":{"txid":"observed-tx","hex":"00"},"error":null,"id":"bbp"})"};
   std::vector<boost::json::value> requests;
   std::future<std::vector<std::string>> served = std::async(
@@ -1242,7 +1242,7 @@ BOOST_AUTO_TEST_CASE(firo_observes_mempool_transaction_with_exact_rpc_payload) {
   BOOST_TEST(observation.confirmations == 0U);
   BOOST_REQUIRE_EQUAL(methods.size(), 3U);
   BOOST_TEST(methods[0] == "getblockcount");
-  BOOST_TEST(methods[1] == "getrawmempool");
+  BOOST_TEST(methods[1] == "getmempoolinfo");
   BOOST_TEST(methods[2] == "getrawtransaction");
   const boost::json::array& params =
       requests[2].as_object().at("params").as_array();
@@ -1261,7 +1261,7 @@ BOOST_AUTO_TEST_CASE(firo_observes_confirmed_transaction) {
       tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0U));
   const std::vector<std::string> responses = {
       R"({"result":30,"error":null,"id":"bbp"})",
-      R"({"result":[],"error":null,"id":"bbp"})",
+      R"({"result":{"size":0},"error":null,"id":"bbp"})",
       R"({"result":{"txid":"confirmed-tx","blockhash":"block-29","height":29,"confirmations":2},"error":null,"id":"bbp"})"};
   std::future<std::vector<std::string>> served =
       std::async(std::launch::async,
@@ -1298,10 +1298,10 @@ BOOST_AUTO_TEST_CASE(firo_waits_through_temporary_transaction_not_found) {
       tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0U));
   const std::vector<std::string> responses = {
       R"({"result":10,"error":null,"id":"bbp"})",
-      R"({"result":[],"error":null,"id":"bbp"})",
+      R"({"result":{"size":0},"error":null,"id":"bbp"})",
       R"({"result":null,"error":{"code":-5,"message":"No such mempool or blockchain transaction"},"id":"bbp"})",
       R"({"result":10,"error":null,"id":"bbp"})",
-      R"({"result":["late-tx"],"error":null,"id":"bbp"})",
+      R"({"result":{"size":1},"error":null,"id":"bbp"})",
       R"({"result":{"txid":"late-tx"},"error":null,"id":"bbp"})"};
   const std::vector<unsigned> response_statuses = {200U, 200U, 500U,
                                                    200U, 200U, 200U};
@@ -1339,7 +1339,7 @@ BOOST_AUTO_TEST_CASE(firo_mempool_wait_accepts_transaction_mined_during_poll) {
       tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0U));
   const std::vector<std::string> responses = {
       R"({"result":30,"error":null,"id":"bbp"})",
-      R"({"result":["racing-tx"],"error":null,"id":"bbp"})",
+      R"({"result":{"size":1},"error":null,"id":"bbp"})",
       R"({"result":{"txid":"racing-tx","blockhash":"block-31","height":31,"confirmations":1},"error":null,"id":"bbp"})"};
   std::future<std::vector<std::string>> served =
       std::async(std::launch::async,
@@ -1369,7 +1369,8 @@ BOOST_AUTO_TEST_CASE(firo_rejects_invalid_transaction_confirmation_numbers) {
         tcp::endpoint(asio::ip::make_address_v4("127.0.0.1"), 0U));
     const std::vector<std::string> responses = {
         R"({"result":30,"error":null,"id":"bbp"})",
-        R"({"result":[],"error":null,"id":"bbp"})", transaction_response};
+        R"({"result":{"size":0},"error":null,"id":"bbp"})",
+        transaction_response};
     std::future<std::vector<std::string>> served =
         std::async(std::launch::async,
                    [&] { return ServeRpcResponses(acceptor, responses); });
@@ -1674,7 +1675,7 @@ BOOST_AUTO_TEST_CASE(firo_submits_public_transfer_with_exact_rpc_payload) {
       R"({"result":true,"error":null,"id":"bbp"})",
       R"({"result":"public-transfer-tx","error":null,"id":"bbp"})",
       R"({"result":202,"error":null,"id":"bbp"})",
-      R"({"result":["public-transfer-tx"],"error":null,"id":"bbp"})",
+      R"({"result":{"size":1},"error":null,"id":"bbp"})",
       R"({"result":{"txid":"public-transfer-tx"},"error":null,"id":"bbp"})"};
   std::vector<boost::json::value> requests;
   std::future<std::vector<std::string>> served = std::async(
@@ -1703,7 +1704,7 @@ BOOST_AUTO_TEST_CASE(firo_submits_public_transfer_with_exact_rpc_payload) {
   BOOST_TEST(methods[0] == "settxfee");
   BOOST_TEST(methods[1] == "sendtoaddress");
   BOOST_TEST(methods[2] == "getblockcount");
-  BOOST_TEST(methods[3] == "getrawmempool");
+  BOOST_TEST(methods[3] == "getmempoolinfo");
   BOOST_TEST(methods[4] == "getrawtransaction");
   BOOST_REQUIRE_EQUAL(requests.size(), 5U);
   const boost::json::array& fee_params =
@@ -1852,11 +1853,11 @@ BOOST_AUTO_TEST_CASE(
       R"({"result":true,"error":null,"id":"bbp"})",
       R"({"result":"late-confirmation-tx","error":null,"id":"bbp"})",
       R"({"result":200,"error":null,"id":"bbp"})",
-      R"({"result":["late-confirmation-tx"],"error":null,"id":"bbp"})",
+      R"({"result":{"size":1},"error":null,"id":"bbp"})",
       R"({"result":{"txid":"late-confirmation-tx"},"error":null,"id":"bbp"})",
       R"({"result":["block-201"],"error":null,"id":"bbp"})",
       R"({"result":201,"error":null,"id":"bbp"})",
-      R"({"result":[],"error":null,"id":"bbp"})",
+      R"({"result":{"size":0},"error":null,"id":"bbp"})",
       R"({"result":{"txid":"late-confirmation-tx","blockhash":"block-201","height":201,"confirmations":1},"error":null,"id":"bbp"})"};
   std::vector<boost::json::value> requests;
   std::future<std::vector<std::string>> served = std::async(
@@ -1998,9 +1999,9 @@ BOOST_AUTO_TEST_CASE(
 
   const std::vector<std::string> methods = served.get();
   const std::vector<std::string> expected_methods = {
-      "settxfee",      "sendtoaddress",     "getblockcount",
-      "getrawmempool", "getrawtransaction", "generatetoaddress",
-      "getblockcount", "getrawmempool",     "getrawtransaction"};
+      "settxfee",       "sendtoaddress",     "getblockcount",
+      "getmempoolinfo", "getrawtransaction", "generatetoaddress",
+      "getblockcount",  "getmempoolinfo",    "getrawtransaction"};
   BOOST_TEST(methods == expected_methods, boost::test_tools::per_element());
 }
 
@@ -2247,7 +2248,7 @@ BOOST_AUTO_TEST_CASE(firo_many_node_observation_shares_one_deadline) {
   for (std::size_t node = 0U; node < 3U; ++node) {
     static_cast<void>(node);
     responses.push_back(R"({"result":1,"error":null,"id":"bbp"})");
-    responses.push_back(R"({"result":[],"error":null,"id":"bbp"})");
+    responses.push_back(R"({"result":{"size":0},"error":null,"id":"bbp"})");
     responses.push_back(
         R"({"result":null,"error":{"code":-5,"message":"not found"},"id":"bbp"})");
     delays.push_back(std::chrono::milliseconds(400));
@@ -2418,7 +2419,7 @@ BOOST_AUTO_TEST_CASE(firo_submits_private_spark_transfer) {
       R"({"result":true,"error":null,"id":"bbp"})",
       R"({"result":"spark-spend-tx","error":null,"id":"bbp"})",
       R"({"result":500,"error":null,"id":"bbp"})",
-      R"({"result":["spark-spend-tx"],"error":null,"id":"bbp"})",
+      R"({"result":{"size":1},"error":null,"id":"bbp"})",
       R"({"result":{"txid":"spark-spend-tx"},"error":null,"id":"bbp"})"};
   std::vector<boost::json::value> requests;
   std::future<std::vector<std::string>> served = std::async(
@@ -2447,7 +2448,7 @@ BOOST_AUTO_TEST_CASE(firo_submits_private_spark_transfer) {
   BOOST_TEST(methods[0] == "settxfee");
   BOOST_TEST(methods[1] == "spendspark");
   BOOST_TEST(methods[2] == "getblockcount");
-  BOOST_TEST(methods[3] == "getrawmempool");
+  BOOST_TEST(methods[3] == "getmempoolinfo");
   BOOST_TEST(methods[4] == "getrawtransaction");
   BOOST_REQUIRE_EQUAL(requests.size(), 5U);
   const boost::json::array& spend_params =
@@ -2596,7 +2597,7 @@ BOOST_AUTO_TEST_CASE(firo_raw_transaction_broadcast_callbacks_bracket_rpc) {
       R"({"result":{"complete":true,"hex":"signed-hex"},"error":null,"id":"bbp"})",
       R"({"result":"broadcast-tx","error":null,"id":"bbp"})",
       R"({"result":101,"error":null,"id":"bbp"})",
-      R"({"result":["broadcast-tx"],"error":null,"id":"bbp"})",
+      R"({"result":{"size":1},"error":null,"id":"bbp"})",
       R"({"result":{"txid":"broadcast-tx"},"error":null,"id":"bbp"})"};
   std::mutex events_mutex;
   std::vector<std::string> events;
@@ -2661,7 +2662,7 @@ BOOST_AUTO_TEST_CASE(firo_raw_transaction_broadcast_callbacks_bracket_rpc) {
       "rpc:sendrawtransaction",
       "after_broadcast:broadcast-tx",
       "rpc:getblockcount",
-      "rpc:getrawmempool",
+      "rpc:getmempoolinfo",
       "rpc:getrawtransaction",
   };
   BOOST_TEST(events == expected_events, boost::test_tools::per_element());
