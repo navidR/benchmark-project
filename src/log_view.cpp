@@ -4,6 +4,7 @@
 #include <array>
 #include <deque>
 #include <fstream>
+#include <iterator>
 #include <sstream>
 
 namespace bbp {
@@ -73,7 +74,8 @@ std::vector<std::string> ReadRecentLogLines(
       lines.pop_front();
     }
   }
-  return {lines.begin(), lines.end()};
+  return {std::make_move_iterator(lines.begin()),
+          std::make_move_iterator(lines.end())};
 }
 
 }  // namespace bbp
