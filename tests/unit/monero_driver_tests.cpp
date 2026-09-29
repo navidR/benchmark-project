@@ -1,3 +1,4 @@
+#include <sys/socket.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -195,7 +196,12 @@ bbp::ChainTransactionObservation ObserveTransactionResponse(
     static_cast<void>(served.get());
     return observation;
   } catch (...) {
-    static_cast<void>(served.get());
+    if (served.valid()) {
+      // An early client error leaves the server waiting for another request.
+      // Wake its blocking accept and preserve the original client exception.
+      static_cast<void>(::shutdown(acceptor.native_handle(), SHUT_RDWR));
+      served.wait();
+    }
     throw;
   }
 }
@@ -935,6 +941,11 @@ BOOST_AUTO_TEST_CASE(monero_driver_normalizes_empty_transaction_results) {
 }
 
 BOOST_AUTO_TEST_CASE(monero_driver_rejects_conflicting_transaction_results) {
+  BOOST_CHECK_EXCEPTION(
+      ObserveTransactionResponse(R"({"status":"BUSY"})"), std::runtime_error,
+      [](const std::runtime_error& error) {
+        return std::string(error.what()).find("BUSY") != std::string::npos;
+      });
   BOOST_CHECK_THROW(
       ObserveTransactionResponse("{\"status\":\"OK\",\"missed_tx\":[\"" +
                                  std::string(kHashB) + "\"]}"),
