@@ -26,7 +26,6 @@ TransactionObservationStore::TransactionObservationStore(std::size_t capacity)
     throw std::runtime_error(
         "transaction observation capacity must be greater than zero");
   }
-  entries_.reserve(capacity_);
 }
 
 TransactionObservationStore::Reservation::Reservation(
@@ -124,6 +123,7 @@ std::size_t TransactionObservationStore::CancelWorkload(
       continue;
     }
     const std::string txid = entry->transaction.txid;
+    entries_by_txid_.erase(txid);
     entry = entries_.erase(entry);
     if (recent_retired_.size() >= capacity_) {
       recent_retired_index_.erase(recent_retired_.front());
@@ -166,23 +166,23 @@ void TransactionObservationStore::CommitReservation(
     }
   }
 
-  std::vector<Entry> staged;
-  staged.reserve(transactions.size());
-  std::set<std::string> new_txids;
+  Entries staged;
+  EntryIndex staged_by_txid;
   for (TrackedTransaction& transaction : transactions) {
     if (transaction.txid.empty()) {
       throw std::runtime_error("cannot track an empty transaction id");
     }
-    if (!new_txids.insert(transaction.txid).second) {
+    const auto entry =
+        staged.insert(staged.end(), Entry{
+                                        .transaction = std::move(transaction),
+                                        .required_node_ids = required,
+                                        .visible_node_ids = {},
+                                        .confirmed_node_ids = {},
+                                    });
+    if (!staged_by_txid.emplace(entry->transaction.txid, entry).second) {
       throw std::runtime_error("duplicate submitted transaction id: " +
-                               transaction.txid);
+                               entry->transaction.txid);
     }
-    staged.push_back(Entry{
-        .transaction = std::move(transaction),
-        .required_node_ids = required,
-        .visible_node_ids = {},
-        .confirmed_node_ids = {},
-    });
   }
 
   std::lock_guard<std::mutex> lock(mutex_);
@@ -192,18 +192,17 @@ void TransactionObservationStore::CommitReservation(
   }
   for (const Entry& staged_entry : staged) {
     const std::string& txid = staged_entry.transaction.txid;
-    const bool active_duplicate = std::any_of(
-        entries_.begin(), entries_.end(),
-        [&](const Entry& entry) { return entry.transaction.txid == txid; });
-    if (active_duplicate || recent_retired_index_.contains(txid)) {
+    if (entries_by_txid_.contains(txid) ||
+        recent_retired_index_.contains(txid)) {
       throw std::runtime_error("duplicate submitted transaction id: " + txid);
     }
   }
   CheckedAdd(static_cast<std::uint64_t>(staged.size()), "tracked count",
              &tracked_);
-  for (Entry& entry : staged) {
-    entries_.push_back(std::move(entry));
-  }
+  // Stage all allocations and reject duplicates before publication. Merge and
+  // splice transfer existing nodes; the index's list iterators stay valid.
+  entries_by_txid_.merge(staged_by_txid);
+  entries_.splice(entries_.end(), staged);
   reserved_ -= reservation->size_;
   reservation->owner_ = nullptr;
   reservation->size_ = 0U;
@@ -259,12 +258,11 @@ TransactionObservationTransition TransactionObservationStore::Record(
   std::shared_ptr<TransactionLoadConfirmation> load_confirmation;
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    const auto entry = std::find_if(
-        entries_.begin(), entries_.end(),
-        [&](const Entry& value) { return value.transaction.txid == txid; });
-    if (entry == entries_.end()) {
+    const auto indexed = entries_by_txid_.find(txid);
+    if (indexed == entries_by_txid_.end()) {
       return {};
     }
+    const auto entry = indexed->second;
     if (!entry->required_node_ids.contains(std::string(node_id))) {
       throw std::runtime_error(
           "transaction observation used unexpected node: " +
@@ -288,6 +286,7 @@ TransactionObservationTransition TransactionObservationStore::Record(
     load_confirmation = entry->transaction.load_confirmation;
     if (entry->confirmed_node_ids.size() == entry->required_node_ids.size()) {
       const std::string retired_txid = entry->transaction.txid;
+      entries_by_txid_.erase(indexed);
       entries_.erase(entry);
       if (recent_retired_.size() >= capacity_) {
         recent_retired_index_.erase(recent_retired_.front());

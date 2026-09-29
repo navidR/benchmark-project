@@ -40,24 +40,38 @@ BOOST_AUTO_TEST_CASE(transaction_observation_store_cancels_only_one_workload) {
   second.workload_id = "wallet-workload-1";
   bbp::TrackedTransaction other = Transaction("other");
   other.workload_id = "wallet-workload-2";
+  bbp::TrackedTransaction later = Transaction("aaa-later");
+  later.workload_id = "wallet-workload-2";
   store.Track(std::move(first), {"node-1"});
-  store.Track(std::move(second), {"node-1"});
   store.Track(std::move(other), {"node-1"});
+  store.Track(std::move(second), {"node-1"});
+  store.Track(std::move(later), {"node-1"});
 
   BOOST_TEST(store.CancelWorkload("wallet-workload-1") == 2U);
   const std::vector<bbp::TrackedTransaction> pending =
       store.PendingTransactions();
-  BOOST_REQUIRE_EQUAL(pending.size(), 1U);
+  BOOST_REQUIRE_EQUAL(pending.size(), 2U);
   BOOST_TEST(pending.front().txid == "other");
   BOOST_TEST(pending.front().workload_id == "wallet-workload-2");
+  BOOST_TEST(pending.back().txid == "aaa-later");
   BOOST_TEST(store.CancelWorkload("wallet-workload-1") == 0U);
   const bbp::TransactionObservationStoreStats stats = store.Stats();
-  BOOST_TEST(stats.active == 1U);
+  BOOST_TEST(stats.active == 2U);
   BOOST_TEST(stats.cancelled == 2U);
   BOOST_TEST(stats.retired == 0U);
   BOOST_CHECK_THROW(store.Track(Transaction("first-1"), {"node-1"}),
                     std::runtime_error);
   BOOST_CHECK_THROW(store.CancelWorkload({}), std::runtime_error);
+
+  BOOST_TEST(store.Record("other", "node-1", true, true).retired);
+  store.Track(Transaction("000-new"), {"node-1"});
+  const auto remaining = store.PendingTransactionsForNode("node-1");
+  BOOST_REQUIRE_EQUAL(remaining.size(), 2U);
+  BOOST_TEST(remaining.front().txid == "aaa-later");
+  BOOST_TEST(remaining.back().txid == "000-new");
+  BOOST_TEST(store.Record("000-new", "node-1", true, true).retired);
+  BOOST_TEST(store.Record("aaa-later", "node-1", true, true).retired);
+  BOOST_TEST(store.PendingTransactions().empty());
 }
 
 BOOST_AUTO_TEST_CASE(transaction_observation_store_is_explicitly_bounded) {
@@ -159,23 +173,32 @@ BOOST_AUTO_TEST_CASE(
 
 BOOST_AUTO_TEST_CASE(
     transaction_observation_commit_is_atomic_and_preserves_reservation_on_error) {
-  bbp::TransactionObservationStore store(2U);
+  bbp::TransactionObservationStore store(3U);
+  store.Track(Transaction("active"), {"node-1"});
   bbp::TransactionObservationStore::Reservation reservation = store.Reserve(2U);
   BOOST_CHECK_THROW(
       reservation.Commit({Transaction("duplicate"), Transaction("duplicate")},
                          {"node-1"}),
       std::runtime_error);
   BOOST_TEST(reservation.size() == 2U);
-  BOOST_TEST(store.Stats().active == 0U);
+  BOOST_TEST(store.Stats().active == 1U);
   BOOST_TEST(store.Stats().reserved == 2U);
-  BOOST_TEST(store.PendingTransactions().empty());
+
+  BOOST_CHECK_THROW(
+      reservation.Commit({Transaction("fresh"), Transaction("active")},
+                         {"node-1"}),
+      std::runtime_error);
+  BOOST_TEST(reservation.size() == 2U);
+  BOOST_TEST(store.Stats().reserved == 2U);
+  BOOST_REQUIRE_EQUAL(store.PendingTransactions().size(), 1U);
+  BOOST_TEST(store.PendingTransactions().front().txid == "active");
 
   reservation.Commit({Transaction("tx-1"), Transaction("tx-2")}, {"node-1"});
   BOOST_TEST(!static_cast<bool>(reservation));
   const bbp::TransactionObservationStoreStats stats = store.Stats();
-  BOOST_TEST(stats.active == 2U);
+  BOOST_TEST(stats.active == 3U);
   BOOST_TEST(stats.reserved == 0U);
-  BOOST_TEST(stats.tracked == 2U);
+  BOOST_TEST(stats.tracked == 3U);
 }
 
 BOOST_AUTO_TEST_CASE(

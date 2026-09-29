@@ -3,6 +3,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <functional>
+#include <list>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -108,6 +111,9 @@ class TransactionObservationStore {
     std::set<std::string> confirmed_node_ids;
   };
 
+  using Entries = std::list<Entry>;
+  using EntryIndex = std::map<std::string, Entries::iterator, std::less<>>;
+
   void CommitReservation(Reservation* reservation,
                          std::vector<TrackedTransaction> transactions,
                          const std::vector<std::string>& required_node_ids);
@@ -115,7 +121,8 @@ class TransactionObservationStore {
 
   mutable std::mutex mutex_;
   const std::size_t capacity_;
-  std::vector<Entry> entries_;
+  Entries entries_;
+  EntryIndex entries_by_txid_;
   std::size_t reserved_ = 0U;
   std::deque<std::string> recent_retired_;
   std::set<std::string> recent_retired_index_;
