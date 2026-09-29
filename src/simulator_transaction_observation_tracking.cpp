@@ -70,7 +70,7 @@ std::size_t TransactionObservationTracker::CancelWorkload(
 }
 
 bool TransactionObservationTracker::HasPending() const {
-  return !observations_.PendingTransactions().empty();
+  return observations_.Stats().active != 0U;
 }
 
 void TransactionObservationTracker::TrackAndWaitForVisibility(
